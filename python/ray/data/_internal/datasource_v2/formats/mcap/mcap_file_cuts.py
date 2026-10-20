@@ -95,6 +95,8 @@ class OrderedFileCutter(FilePartitioner):
     heavy files' tasks bypass it. See the module docstring for where a heavy
     file is cut. ``reserved_memory`` is the
     memory each read task reserves (``read_mcap(memory=...)``), if the read sets it.
+    With ``records``, each row is one Attachment or Metadata record, which any
+    task may take, so a file's records are spread over tasks in listing order.
     """
 
     def __init__(
@@ -104,8 +106,10 @@ class OrderedFileCutter(FilePartitioner):
         budget: int,
         log_time_order: bool,
         reserved_memory: Optional[float] = None,
+        records: bool = False,
     ):
         self._packer = packer
+        self._records = records
         self._budget = budget
         self._log_time_order = log_time_order
         self._reserved_memory = reserved_memory
@@ -141,6 +145,12 @@ class OrderedFileCutter(FilePartitioner):
 
     def _place(self, file_rows: _FileRows) -> None:
         """Pack one file with others, or cut it into tasks of its own."""
+        if self._records and self._keeps_order:
+            block = file_rows.rows.as_block()
+            assert isinstance(block, pa.Table)
+            for i in range(block.num_rows):
+                self._ordered.add(FileManifest(block.slice(i, 1)))
+            return
         if not file_rows.chunks:
             self._pack(file_rows.rows)
             return
