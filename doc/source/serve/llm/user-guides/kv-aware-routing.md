@@ -112,7 +112,9 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model": "qwen3-0.6b", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-The first request selects a replica by estimated token load and KV cache overlap. Later turns stay on that replica even when another has lower load or more cached tokens. After the session's idle timeout, or if the replica becomes unavailable or ineligible, the router selects again.
+HAProxy uses rendezvous hashing over the application's router pool to select an `LLMRouter` for each session. This improves token-cache reuse across turns.
+
+The first request selects a model replica by estimated token load and KV cache overlap. Later turns stay on that model replica even when another has lower load or more cached tokens. After the session's idle timeout, or if the replica becomes unavailable or ineligible, the router selects again.
 
 Session pinning is enabled by default with a 30-minute idle timeout. Set `session_affinity_ttl_s` in seconds to change it:
 
@@ -204,6 +206,17 @@ The router scores requests using token IDs, so each request is tokenized at the 
 - **Tokenization adds CPU overhead at the ingress.** This is the primary reason to scale the number of ingress replicas.
 
 - **Tokenization is not repeated at the engine.** The ingress sends the tokenized prompt to the selected engine replica, avoiding duplicate tokenization. The tokens are sent over a separate channel and may arrive before the corresponding HTTP request, so the engine replica temporarily **stages** them until the request arrives. Delivery is best effort: if the token payload is missing or has expired, the engine simply tokenizes the prompt again. The `RAY_SERVE_LLM_KV_TOKEN_STAGING_*` variables control how long and how much token data each engine replica can stage.
+
+When vLLM uses fastokens, its native segment cache reuses tokenized conversation segments across turns and branches. Ray Serve LLM defaults `FASTOKENS_SEGMENT_CACHE` to `1024` MiB for the tokenizing router. This provides headroom for 32 conversations of about 500,000 tokens each. Capacity depends on the text size and segment boundaries. Override the budget in the `LLMConfig.runtime_env`:
+
+```yaml
+runtime_env:
+  env_vars:
+    VLLM_USE_FASTOKENS: "1"
+    FASTOKENS_SEGMENT_CACHE: "1024"
+```
+
+Use a fastokens build with segment-cache support. The model's `runtime_env` value takes precedence over the inherited environment value. The budget counts native cached segments and is separate from engine token staging. Builds that share caches across tokenizer copies use one budget for the pool. Other builds use a budget per copy. See the [fastokens segment-cache documentation](https://github.com/crusoecloud/fastokens#segment-cache-chat-and-agent-traffic).
 
 You can use `KVAwareRouter` with Anthropic Messages (`/v1/messages`) clients such as Claude Code. Use the same routing configuration as for OpenAI requests.
 

@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import copy
 import hashlib
 import json
 import logging
@@ -43,6 +44,7 @@ from ray.serve._private.constants import (
     SERVE_INGRESS_ROUTER_HEADER_PREFIX,
     SERVE_INGRESS_ROUTER_REQUEST_PATH_HEADER,
     SERVE_MULTIPLEXED_MODEL_ID,
+    SERVE_SESSION_ID,
 )
 from ray.serve._private.haproxy import (
     BackendConfig,
@@ -632,9 +634,8 @@ def _make_api(temp_dir, backend_configs):
     )
 
 
-def test_routers_and_targets_prefers_colocated_router():
-    """Each HAProxy round-robins across the routers co-located on its own node,
-    and falls back to a single deterministic pick when none is co-located."""
+def test_routers_and_targets_includes_all_routers():
+    """Every proxy hashes sessions over the same application-wide pool."""
     local = "10.0.0.1"
 
     colocated = [
@@ -651,11 +652,15 @@ def test_routers_and_targets_prefers_colocated_router():
             ],
         )
     ]
-    # Both on-node routers form the sorted pool; the remote router is excluded.
-    routers, _ = _routers_and_targets_by_backend(colocated, local_host=local)
-    assert [s.name for s in routers["llm"]] == ["router_local_a", "router_local_b"]
+    # Include remote routers so sessions have the same owner through every proxy.
+    routers, _ = _routers_and_targets_by_backend(colocated)
+    assert [s.name for s in routers["llm"]] == [
+        "router_local_a",
+        "router_local_b",
+        "router_remote",
+    ]
 
-    # No router on this node falls back to a single lexicographically smallest.
+    # Remote endpoints also form a complete, deterministically ordered pool.
     remote_only = [
         BackendConfig(
             name="llm",
@@ -669,8 +674,8 @@ def test_routers_and_targets_prefers_colocated_router():
             ],
         )
     ]
-    routers, _ = _routers_and_targets_by_backend(remote_only, local_host=local)
-    assert [s.name for s in routers["llm"]] == ["router_a"]
+    routers, _ = _routers_and_targets_by_backend(remote_only)
+    assert [s.name for s in routers["llm"]] == ["router_a", "router_b"]
 
 
 def test_write_ingress_request_router_lua_pools_colocated_routers(haproxy_api_cleanup):
@@ -1394,6 +1399,137 @@ async def test_ingress_request_router_end_to_end(haproxy_api_cleanup, monkeypatc
             _shutdown_fake_servers(
                 (replica_a, replica_b, router),
                 (replica_a_thread, replica_b_thread, router_thread),
+            )
+
+
+@pytest.mark.asyncio
+async def test_ingress_request_router_session_affinity(
+    haproxy_api_cleanup, monkeypatch
+):
+    """Sessions keep their router across proxies and fail over deterministically."""
+    # Requests without a session can use all three local routers.
+    monkeypatch.setattr(
+        "ray.serve._private.haproxy.get_localhost_ip", lambda: "127.0.0.1"
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        haproxy_port = find_free_port()
+        stats_port = find_free_port()
+        remote_proxy_port = find_free_port()
+        replica_port = find_free_port()
+        router_ports = sorted(find_free_port() for _ in range(3))
+        actor_name = "SERVE_REPLICA::app#dep#aaa"
+        replica, replica_thread = _create_replica_server(
+            replica_port, replica_id_header="A"
+        )
+        routers = [
+            _create_router_server(port, replica_id_to_return=actor_name)
+            for port in router_ports
+        ]
+
+        def counts():
+            return [len(captured["bodies"]) for _, _, captured in routers]
+
+        def post(headers=None, port=haproxy_port) -> int:
+            """Sends one request; returns the index of the router it used."""
+            before = counts()
+            resp = requests.post(
+                f"http://127.0.0.1:{port}/predict",
+                json={"prompt": "hi"},
+                headers=headers or {},
+                timeout=5,
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.headers.get("x-replica-id") == "A"
+            used = [i for i, (a, b) in enumerate(zip(before, counts())) if b > a]
+            assert len(used) == 1, (before, counts())
+            return used[0]
+
+        try:
+            backend = BackendConfig(
+                name="llm",
+                path_prefix="/",
+                app_name="llm",
+                http_health_check_path="/-/healthz",
+                servers=[
+                    ServerConfig(
+                        name="A",
+                        host="127.0.0.1",
+                        port=replica_port,
+                        replica_id=actor_name,
+                    ),
+                ],
+                ingress_request_router_servers=[
+                    ServerConfig(name=f"router_{i}", host="127.0.0.1", port=port)
+                    for i, port in enumerate(router_ports)
+                ],
+            )
+            await _start_router_haproxy(
+                temp_dir,
+                haproxy_port,
+                stats_port,
+                {"llm": backend},
+                haproxy_api_cleanup,
+                # One thread, so one round-robin cursor (each thread's Lua
+                # state has its own).
+                nbthread=1,
+            )
+
+            # A second proxy has no co-located routers but must pick the same
+            # session owner from the full pool, independent of endpoint order.
+            monkeypatch.setattr(
+                "ray.serve._private.haproxy.get_localhost_ip", lambda: "127.0.0.2"
+            )
+            remote_dir = os.path.join(temp_dir, "remote")
+            os.mkdir(remote_dir)
+            remote_backend = copy.deepcopy(backend)
+            remote_backend.ingress_request_router_servers.reverse()
+            await _start_router_haproxy(
+                remote_dir,
+                remote_proxy_port,
+                find_free_port(),
+                {"llm": remote_backend},
+                haproxy_api_cleanup,
+                nbthread=1,
+                metrics_port=find_free_port(),
+            )
+
+            sessions = [f"session-{i}" for i in range(12)]
+            first = {}
+            for sid in sessions:
+                expected = post({SERVE_SESSION_ID: sid})
+                for _ in range(2):
+                    assert post({SERVE_SESSION_ID: sid}) == expected, sid
+                    assert (
+                        post({SERVE_SESSION_ID: sid}, remote_proxy_port) == expected
+                    ), sid
+                first[sid] = expected
+            # Sessions spread over the routers.
+            assert len(set(first.values())) > 1, first
+
+            # The header matches like _matches_session_id_header: any case,
+            # "-" and "_" interchangeable.
+            mixed = SERVE_SESSION_ID.upper().replace("-", "_", 1)
+            assert post({mixed: sessions[0]}) == first[sessions[0]]
+
+            # No-session requests use local round robin or the first remote.
+            assert sorted(post() for _ in range(3)) == [0, 1, 2]
+            assert sorted(post({SERVE_SESSION_ID: ""}) for _ in range(3)) == [0, 1, 2]
+            assert post(port=remote_proxy_port) == 0
+
+            # Both proxies must agree on failover when the owner is down.
+            sid = sessions[0]
+            down_server, down_thread, _ = routers[first[sid]]
+            _shutdown_fake_servers((down_server,), (down_thread,))
+            fallback = post({SERVE_SESSION_ID: sid})
+            assert fallback != first[sid]
+            assert post({SERVE_SESSION_ID: sid}, remote_proxy_port) == fallback
+            for other_sid, owner in first.items():
+                if owner != first[sid]:
+                    assert post({SERVE_SESSION_ID: other_sid}) == owner
+        finally:
+            _shutdown_fake_servers(
+                [replica] + [server for server, _, _ in routers],
+                [replica_thread] + [thread for _, thread, _ in routers],
             )
 
 

@@ -157,13 +157,11 @@ def _load_lua_template(*file_names: str) -> string.Template:
 
 def _routers_and_targets_by_backend(
     backends: "List[BackendConfig]",
-    local_host: "Optional[str]" = None,
 ) -> "Tuple[Dict[str, List[ServerConfig]], Dict[str, List[Tuple[str, str]]]]":
-    """Router pools and replica maps for routed or fallback-enabled backends.
+    """Application-wide router pools and their replica maps.
 
-    Prefers routers co-located with this HAProxy so the /internal/route hop
-    stays on-node. Falls back to the lexicographically smallest router when none
-    is co-located.
+    All proxies must hash sessions over the same endpoints. Lua separately
+    prefers local routers for requests without a session ID.
     """
     routers: Dict[str, List[ServerConfig]] = {}
     targets: Dict[str, List[Tuple[str, str]]] = {}
@@ -178,15 +176,9 @@ def _routers_and_targets_by_backend(
         ]
         if not entries:
             continue
-        candidates = backend.ingress_request_router_servers
-        colocated = [s for s in candidates if s.host == local_host]
-        if not candidates:
-            pool = []
-        elif colocated:
-            pool = sorted(colocated, key=lambda s: (s.host, s.port))
-        else:
-            pool = [min(candidates, key=lambda s: (s.host, s.port))]
-        routers[backend.name] = pool
+        routers[backend.name] = sorted(
+            backend.ingress_request_router_servers, key=lambda s: (s.host, s.port)
+        )
         targets[backend.name] = entries
     return routers, targets
 
@@ -1334,9 +1326,7 @@ class HAProxyApi(ProxyApi):
         Returns the script path, or None if no backend has both ingress
         request routers AND replicas with replica IDs.
         """
-        routers, targets = _routers_and_targets_by_backend(
-            backends, local_host=get_localhost_ip()
-        )
+        routers, targets = _routers_and_targets_by_backend(backends)
         if not routers:
             return None
 
@@ -1368,6 +1358,7 @@ class HAProxyApi(ProxyApi):
             SESSION_HEADER=SERVE_SESSION_ID.lower(),
             REQUEST_PATH_HEADER=SERVE_INGRESS_ROUTER_REQUEST_PATH_HEADER,
             ROUTERS=_format_routers_lua(routers),
+            LOCAL_HOST=_lua_str(get_localhost_ip()),
             REPLICA_TARGETS=_format_replica_targets_lua(targets),
             METRICS_PRE_CALL_ROUTER=metrics_pre,
             METRICS_POST_CALL_ROUTER=metrics_post,

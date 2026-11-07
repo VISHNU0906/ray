@@ -4,6 +4,20 @@ local FORWARD_BODY = ${FORWARD_BODY}
 local MODEL_ID_HEADER = "serve_multiplexed_model_id"
 local ROUTERS = ${ROUTERS}
 local REPLICA_TARGETS = ${REPLICA_TARGETS}
+local LOCAL_ROUTERS = {}
+-- Preserve locality for requests without a session; sessions use the full pool.
+for app, pool in pairs(ROUTERS) do
+    local local_pool = {}
+    for _, router in ipairs(pool) do
+        if router.host == ${LOCAL_HOST} then
+            local_pool[#local_pool + 1] = router
+        end
+    end
+    if #local_pool == 0 and #pool > 0 then
+        local_pool[1] = pool[1]
+    end
+    LOCAL_ROUTERS[app] = local_pool
+end
 local _rr_cursor = {}
 
 -- Headers named by Connection are added dynamically.
@@ -49,6 +63,40 @@ local function request_headers_for_router(headers)
     return table.concat(lines)
 end
 
+-- 32-bit FNV-1a of s, continuing from hash h.
+local function fnv1a32(h, s)
+    for i = 1, #s do
+        h = ((h ~ s:byte(i)) * 16777619) & 0xFFFFFFFF
+    end
+    return h
+end
+
+-- MurmurHash3's 32-bit finalizer, so weights that share the session prefix
+-- still differ in every bit.
+local function fmix32(h)
+    h = h ~ (h >> 16)
+    h = (h * 0x85EBCA6B) & 0xFFFFFFFF
+    h = h ~ (h >> 13)
+    h = (h * 0xC2B2AE35) & 0xFFFFFFFF
+    return h ~ (h >> 16)
+end
+
+-- One pass selects a stable session owner without a ring or virtual nodes.
+-- Endpoint identity, rather than pool position, keeps membership changes local.
+local function rendezvous_pick(pool, session_id)
+    local seed = (fnv1a32(2166136261, session_id) * 16777619) & 0xFFFFFFFF
+    local best, weights = 1, {}
+    for i = 1, #pool do
+        weights[i] = fmix32(fnv1a32(seed, pool[i].host_header))
+        if weights[i] > weights[best]
+            or (weights[i] == weights[best]
+                and pool[i].host_header < pool[best].host_header) then
+            best = i
+        end
+    end
+    return best, weights
+end
+
 local function set_router_response_headers(txn, json_body)
     local headers = json_body:match('"request_headers"%s*:%s*{(.-)}')
     if not headers then
@@ -79,17 +127,39 @@ local function route(txn, app, pool, replica_map)
         end
     end
 
+    local session_id = session_id_from(hdrs)
+    if not session_id or session_id == "" then
+        pool = LOCAL_ROUTERS[app]
+    end
     local n = #pool
     if n == 0 then
         txn:set_var("txn.ingress_request_router_failed", "router_unavailable")
         return
     end
-    local start = _rr_cursor[app] or 0
-    _rr_cursor[app] = start + 1
+    local start, weights, order
+    if n > 1 and session_id and session_id ~= "" then
+        local best
+        best, weights = rendezvous_pick(pool, session_id)
+        start = best - 1
+    else
+        start = _rr_cursor[app] or 0
+        _rr_cursor[app] = start + 1
+    end
     local response = nil
     for i = 0, n - 1 do
+        -- Only rank the remaining routers when the first connection fails.
+        if i == 1 and weights then
+            order = {}
+            for j = 1, n do order[j] = j end
+            table.sort(order, function(a, b)
+                if weights[a] ~= weights[b] then
+                    return weights[a] > weights[b]
+                end
+                return pool[a].host_header < pool[b].host_header
+            end)
+        end
         response = call_router(
-            pool[(start + i) % n + 1],
+            order and pool[order[i + 1]] or pool[(start + i) % n + 1],
             {headers = headers, body = body}
         )
         if response then
